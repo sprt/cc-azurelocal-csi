@@ -191,3 +191,5 @@ replace (
 	k8s.io/sample-cli-plugin => k8s.io/sample-cli-plugin v0.29.0
 	k8s.io/sample-controller => k8s.io/sample-controller v0.29.0
 )
+
+replace github.com/kubernetes-sigs/azuredisk-csi-driver => .
