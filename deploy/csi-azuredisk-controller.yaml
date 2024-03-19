@@ -141,8 +141,8 @@ spec:
               cpu: 10m
               memory: 20Mi
         - name: azuredisk
-          image: mcr.microsoft.com/oss/kubernetes-csi/azuredisk-csi:v1.30.0
-          imagePullPolicy: IfNotPresent
+          image: sprt24/azuredisk-csi
+          imagePullPolicy: Always
           args:
             - "--v=5"
             - "--endpoint=$(CSI_ENDPOINT)"
