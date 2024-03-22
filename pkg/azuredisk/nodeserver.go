@@ -18,6 +18,7 @@ package azuredisk
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,6 +41,8 @@ import (
 	"k8s.io/klog/v2"
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
+
+	directvolume "github.com/kata-containers/kata-containers/src/runtime/pkg/direct-volume"
 )
 
 const (
@@ -178,6 +181,15 @@ func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 		}
 		klog.V(2).Infof("NodeStageVolume: fs resize successful on target(%s) volumeid(%s).", target, diskURI)
 	}
+
+	// Mounting was only necessary for the potential resize above. Since we're
+	// passing the volume to the guest as a device, unmount it now to avoid any
+	// unintended use by the host.
+	err = CleanupMountPoint(target, d.mounter, true /*extensiveMountPointCheck*/)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "NodeStageVolume: could not unmount %s (%s): %v", source, target, err)
+	}
+
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
@@ -197,13 +209,6 @@ func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolume
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer d.volumeLocks.Release(volumeID)
-
-	klog.V(2).Infof("NodeUnstageVolume: unmounting %s", stagingTargetPath)
-	err := CleanupMountPoint(stagingTargetPath, d.mounter, true /*extensiveMountPointCheck*/)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to unmount staging target %q: %v", stagingTargetPath, err)
-	}
-	klog.V(2).Infof("NodeUnstageVolume: unmount %s successfully", stagingTargetPath)
 
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
@@ -240,48 +245,48 @@ func (d *Driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolume
 		return nil, status.Error(codes.InvalidArgument, "Target path not provided")
 	}
 
-	err = preparePublishPath(target, d.mounter)
+	lun, ok := req.PublishContext[consts.LUN]
+	if !ok {
+		return nil, status.Error(codes.InvalidArgument, "lun not provided")
+	}
+	device, err := d.getDevicePathWithLUN(lun)
 	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("Target path could not be prepared: %v", err))
+		return nil, status.Errorf(codes.Internal, "failed to find device path with lun %s. %v", lun, err)
 	}
+	klog.V(2).Infof("NodePublishVolume: found device path %s with lun %s", device, lun)
 
-	mountOptions := []string{"bind"}
-	if req.GetReadonly() {
-		mountOptions = append(mountOptions, "ro")
-	}
-
-	switch req.GetVolumeCapability().GetAccessType().(type) {
-	case *csi.VolumeCapability_Block:
-		lun, ok := req.PublishContext[consts.LUN]
-		if !ok {
-			return nil, status.Error(codes.InvalidArgument, "lun not provided")
-		}
-		var err error
-		source, err = d.getDevicePathWithLUN(lun)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to find device path with lun %s. %v", lun, err)
-		}
-		klog.V(2).Infof("NodePublishVolume [block]: found device path %s with lun %s", source, lun)
-		if err = d.ensureBlockTargetFile(target); err != nil {
-			return nil, status.Errorf(codes.Internal, err.Error())
-		}
-	case *csi.VolumeCapability_Mount:
-		mnt, err := d.ensureMountPoint(target)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "could not mount target %q: %v", target, err)
-		}
-		if mnt {
-			klog.V(2).Infof("NodePublishVolume: already mounted on target %s", target)
-			return &csi.NodePublishVolumeResponse{}, nil
+	// Get fsType that the volume will be formatted and mounted with
+	fstype := getDefaultFsType()
+	if mnt := volumeCapability.GetMount(); mnt != nil {
+		if mnt.FsType != "" {
+			fstype = mnt.FsType
 		}
 	}
 
-	klog.V(2).Infof("NodePublishVolume: mounting %s at %s", source, target)
-	if err := d.mounter.Mount(source, target, "", mountOptions); err != nil {
-		return nil, status.Errorf(codes.Internal, "could not mount %q at %q: %v", source, target, err)
+	volContextFSType := azureutils.GetFStype(req.GetVolumeContext())
+	if volContextFSType != "" {
+		// respect "fstype" setting in storage class parameters
+		fstype = volContextFSType
 	}
 
-	klog.V(2).Infof("NodePublishVolume: mount %s at %s successfully", source, target)
+	mountInfo := directvolume.MountInfo{
+		VolumeType: "blk",
+		Device:     device,
+		FsType:     fstype,
+		Metadata:   nil,
+		Options:    nil,
+	}
+
+	rawMountInfo, err := json.Marshal(mountInfo)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to marshal mount info: %v", err)
+	}
+
+	err = directvolume.Add(target, string(rawMountInfo))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to add direct volume: %v", err)
+	}
+	klog.V(2).Infof("NodePublishVolume: add direct volume: %v", mountInfo)
 
 	return &csi.NodePublishVolumeResponse{}, nil
 }
@@ -298,13 +303,12 @@ func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 		return nil, status.Error(codes.InvalidArgument, "Target path missing in request")
 	}
 
-	klog.V(2).Infof("NodeUnpublishVolume: unmounting volume %s on %s", volumeID, targetPath)
-	err := CleanupMountPoint(targetPath, d.mounter, true /*extensiveMountPointCheck*/)
+	klog.V(2).Infof("NodeUnpublishVolume: removing direct volume %s", targetPath)
+	err := directvolume.Remove(targetPath)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to unmount target %q: %v", targetPath, err)
+		return nil, status.Errorf(codes.Internal, "failed to remove direct volume %q: %v", targetPath, err)
 	}
-
-	klog.V(2).Infof("NodeUnpublishVolume: unmount volume %s on %s successfully", volumeID, targetPath)
+	klog.V(2).Infof("NodeUnpublishVolume: remove direct volume %s", targetPath)
 
 	return &csi.NodeUnpublishVolumeResponse{}, nil
 }
