@@ -19,14 +19,15 @@ package azuredisk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
-	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization"
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
 	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
@@ -60,15 +61,22 @@ func getDefaultFsType() string {
 	return defaultLinuxFsType
 }
 
+// getDeviceSymlinkPath returns the path of the symlink that is used to
+// point to the loop device from inside the specified stagingTargetPath
+// directory.
+func getDeviceSymlinkPath(stagingTargetPath string) string {
+	return filepath.Join(stagingTargetPath, "device")
+}
+
 // NodeStageVolume mount disk device to a staging path
 func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
-	diskURI := req.GetVolumeId()
-	if len(diskURI) == 0 {
+	image := req.GetVolumeId()
+	if len(image) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
-	target := req.GetStagingTargetPath()
-	if len(target) == 0 {
+	stagingTarget := req.GetStagingTargetPath()
+	if len(stagingTarget) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
 	}
 
@@ -78,6 +86,12 @@ func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 	}
 
 	params := req.GetVolumeContext()
+
+	capacityBytes, err := azureutils.GetCapacityBytes(params)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "CapacityBytes value not supported: %s", err)
+	}
+
 	maxShares, err := azureutils.GetMaxShares(params)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, "MaxShares value not supported")
@@ -87,107 +101,48 @@ func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	if acquired := d.volumeLocks.TryAcquire(diskURI); !acquired {
-		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, diskURI)
+	if acquired := d.volumeLocks.TryAcquire(image); !acquired {
+		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, image)
 	}
-	defer d.volumeLocks.Release(diskURI)
+	defer d.volumeLocks.Release(image)
 
-	lun, ok := req.PublishContext[consts.LUN]
-	if !ok {
-		return nil, status.Error(codes.InvalidArgument, "lun not provided")
-	}
-
-	source, err := d.getDevicePathWithLUN(lun)
+	f, err := os.Create(image)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to find disk on lun %s. %v", lun, err)
+		return nil, status.Errorf(codes.Internal, "failed to create disk image: %v", err)
+	}
+	if err := f.Truncate(capacityBytes); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to resize disk image: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to close disk image file: %v", err)
 	}
 
-	// If perf optimizations are enabled
-	// tweak device settings to enhance performance
-	if d.getPerfOptimizationEnabled() {
-		profile, accountType, diskSizeGibStr, diskIopsStr, diskBwMbpsStr, deviceSettings, err := optimization.GetDiskPerfAttributes(req.GetVolumeContext())
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to get perf attributes for %s. Error: %v", source, err)
-		}
-
-		if d.getDeviceHelper().DiskSupportsPerfOptimization(profile, accountType) {
-			if err := d.getDeviceHelper().OptimizeDiskPerformance(d.getNodeInfo(), source, profile, accountType,
-				diskSizeGibStr, diskIopsStr, diskBwMbpsStr, deviceSettings); err != nil {
-				return nil, status.Errorf(codes.Internal, "failed to optimize device performance for target(%s) error(%s)", source, err)
-			}
-		} else {
-			klog.V(6).Infof("NodeStageVolume: perf optimization is disabled for %s. perfProfile %s accountType %s", source, profile, accountType)
-		}
+	// TODO: Handle filesystem type.
+	if err := exec.Command("mkfs.ext4", image).Run(); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to format image: %v", err)
 	}
 
-	// If the access type is block, do nothing for stage
-	switch req.GetVolumeCapability().GetAccessType().(type) {
-	case *csi.VolumeCapability_Block:
+	deviceSymlink := getDeviceSymlinkPath(stagingTarget)
+
+	// Ensure idempotency per the spec.
+	// TODO: Take into account volume_capability here.
+	if _, err := os.Stat(deviceSymlink); err == nil {
 		return &csi.NodeStageVolumeResponse{}, nil
 	}
 
-	mnt, err := d.ensureMountPoint(target)
+	losetupOut, err := exec.Command("losetup", "-f", "--show", image).Output()
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "could not mount target %q: %v", target, err)
-	}
-	if mnt {
-		klog.V(2).Infof("NodeStageVolume: already mounted on target %s", target)
-		return &csi.NodeStageVolumeResponse{}, nil
-	}
-
-	// Get fsType and mountOptions that the volume will be formatted and mounted with
-	fstype := getDefaultFsType()
-	options := []string{}
-	if mnt := volumeCapability.GetMount(); mnt != nil {
-		if mnt.FsType != "" {
-			fstype = mnt.FsType
+		var stderr []byte
+		if exitErr, isExitError := err.(*exec.ExitError); isExitError {
+			stderr = exitErr.Stderr
 		}
-		options = append(options, collectMountOptions(fstype, mnt.MountFlags)...)
+		return nil, status.Errorf(codes.Internal, "failed to set up loop device from %s: %v: %s", image, err, stderr)
 	}
 
-	volContextFSType := azureutils.GetFStype(req.GetVolumeContext())
-	if volContextFSType != "" {
-		// respect "fstype" setting in storage class parameters
-		fstype = volContextFSType
-	}
+	loopDevice := strings.TrimSuffix(string(losetupOut), "\n")
 
-	// If partition is specified, should mount it only instead of the entire disk.
-	if partition, ok := req.GetVolumeContext()[consts.VolumeAttributePartition]; ok {
-		source = source + "-part" + partition
-	}
-
-	// FormatAndMount will format only if needed
-	klog.V(2).Infof("NodeStageVolume: formatting %s and mounting at %s with mount options(%s)", source, target, options)
-	if err := d.formatAndMount(source, target, fstype, options); err != nil {
-		return nil, status.Errorf(codes.Internal, "could not format %s(lun: %s), and mount it at %s, failed with %v", source, lun, target, err)
-	}
-	klog.V(2).Infof("NodeStageVolume: format %s and mounting at %s successfully.", source, target)
-
-	var needResize bool
-	if required, ok := req.GetVolumeContext()[consts.ResizeRequired]; ok && strings.EqualFold(required, consts.TrueValue) {
-		needResize = true
-	}
-	if !needResize {
-		if needResize, err = needResizeVolume(source, target, d.mounter); err != nil {
-			klog.Errorf("NodeStageVolume: could not determine if volume %s needs to be resized: %v", diskURI, err)
-		}
-	}
-
-	// if resize is required, resize filesystem
-	if needResize {
-		klog.V(2).Infof("NodeStageVolume: fs resize initiating on target(%s) volumeid(%s)", target, diskURI)
-		if err := resizeVolume(source, target, d.mounter); err != nil {
-			return nil, status.Errorf(codes.Internal, "NodeStageVolume: could not resize volume %s (%s):  %v", source, target, err)
-		}
-		klog.V(2).Infof("NodeStageVolume: fs resize successful on target(%s) volumeid(%s).", target, diskURI)
-	}
-
-	// Mounting was only necessary for the potential resize above. Since we're
-	// passing the volume to the guest as a device, unmount it now to avoid any
-	// unintended use by the host.
-	err = CleanupMountPoint(target, d.mounter, true /*extensiveMountPointCheck*/)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "NodeStageVolume: could not unmount %s (%s): %v", source, target, err)
+	if err := os.Symlink(loopDevice, deviceSymlink); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create symlink at %s: %v", deviceSymlink, err)
 	}
 
 	return &csi.NodeStageVolumeResponse{}, nil
@@ -195,28 +150,52 @@ func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 
 // NodeUnstageVolume unmount disk device from a staging path
 func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
-	if len(volumeID) == 0 {
+	image := req.GetVolumeId()
+	if len(image) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
-	stagingTargetPath := req.GetStagingTargetPath()
-	if len(stagingTargetPath) == 0 {
+	stagingTarget := req.GetStagingTargetPath()
+	if len(stagingTarget) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
 	}
 
-	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
-		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
+	if acquired := d.volumeLocks.TryAcquire(image); !acquired {
+		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, image)
 	}
-	defer d.volumeLocks.Release(volumeID)
+	defer d.volumeLocks.Release(image)
+
+	// Ensure idempotency per the spec.
+	if _, err := os.Stat(image); errors.Is(err, os.ErrNotExist) {
+		return &csi.NodeUnstageVolumeResponse{}, nil
+	}
+
+	deviceLink := getDeviceSymlinkPath(stagingTarget)
+
+	// We have to resolve the symlink first because losetup won't follow it.
+	canonicalDevice, err := filepath.EvalSymlinks(deviceLink)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to resolve device symlink %s: %v", deviceLink, err)
+	}
+	if err := exec.Command("losetup", "-d", canonicalDevice).Run(); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to detach loop device %s: %v", deviceLink, err)
+	}
+
+	if err := os.Remove(deviceLink); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to remove device symlink %s: %v", deviceLink, err)
+	}
+
+	if err := os.Remove(image); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to remove image %s: %v", image, err)
+	}
 
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
 // NodePublishVolume mount the volume from staging to target path
 func (d *Driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
-	if len(volumeID) == 0 {
+	image := req.GetVolumeId()
+	if len(image) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
 	}
 
@@ -235,8 +214,8 @@ func (d *Driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolume
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	source := req.GetStagingTargetPath()
-	if len(source) == 0 {
+	stagingTarget := req.GetStagingTargetPath()
+	if len(stagingTarget) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
 	}
 
@@ -245,15 +224,17 @@ func (d *Driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolume
 		return nil, status.Error(codes.InvalidArgument, "Target path not provided")
 	}
 
-	lun, ok := req.PublishContext[consts.LUN]
-	if !ok {
-		return nil, status.Error(codes.InvalidArgument, "lun not provided")
+	device := getDeviceSymlinkPath(stagingTarget)
+
+	if _, err := os.Stat(device); errors.Is(err, os.ErrNotExist) {
+		return nil, status.Errorf(codes.Internal, "device symlink does not exist: %s", device)
 	}
-	device, err := d.getDevicePathWithLUN(lun)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to find device path with lun %s. %v", lun, err)
+
+	// Ensure idempotency per the spec.
+	// TODO: Take into account volume_capability and readonly flag here.
+	if _, err := directvolume.VolumeMountInfo(target); err == nil {
+		return &csi.NodePublishVolumeResponse{}, nil
 	}
-	klog.V(2).Infof("NodePublishVolume: found device path %s with lun %s", device, lun)
 
 	// Get fsType that the volume will be formatted and mounted with
 	fstype := getDefaultFsType()
@@ -294,9 +275,9 @@ func (d *Driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolume
 // NodeUnpublishVolume unmount the volume from the target path
 func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	targetPath := req.GetTargetPath()
-	volumeID := req.GetVolumeId()
+	image := req.GetVolumeId()
 
-	if len(volumeID) == 0 {
+	if len(image) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
 	}
 	if len(targetPath) == 0 {

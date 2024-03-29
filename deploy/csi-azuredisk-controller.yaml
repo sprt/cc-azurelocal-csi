@@ -174,11 +174,15 @@ spec:
                   optional: true
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
+            - name: DISK_IMAGE_DIR
+              value: /images
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
             - mountPath: /etc/kubernetes/
               name: azure-cred
+            - mountPath: /images
+              name: image-dir
           resources:
             limits:
               memory: 500Mi
@@ -191,4 +195,8 @@ spec:
         - name: azure-cred
           hostPath:
             path: /etc/kubernetes/
+            type: DirectoryOrCreate
+        - name: image-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/cc.local.csi.azure.com/images
             type: DirectoryOrCreate

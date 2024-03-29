@@ -336,6 +336,20 @@ func GetMaxShares(attributes map[string]string) (int, error) {
 	return 1, nil // disk is not shared
 }
 
+func GetCapacityBytes(attributes map[string]string) (int64, error) {
+	for k, v := range attributes {
+		switch strings.ToLower(k) {
+		case consts.CapacityBytesField:
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				return 0, err
+			}
+			return n, nil
+		}
+	}
+	return 0, fmt.Errorf("field %q not found", consts.CapacityBytesField)
+}
+
 func GetResourceGroupFromURI(diskURI string) (string, error) {
 	fields := strings.Split(diskURI, "/")
 	if len(fields) != 9 || strings.ToLower(fields[3]) != "resourcegroups" {

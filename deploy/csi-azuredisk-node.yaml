@@ -72,7 +72,7 @@ spec:
             - name: ADDRESS
               value: /csi/csi.sock
             - name: DRIVER_REG_SOCK_PATH
-              value: /var/lib/kubelet/plugins/cc.disk.csi.azure.com/csi.sock
+              value: /var/lib/kubelet/plugins/cc.local.csi.azure.com/csi.sock
           volumeMounts:
             - name: socket-dir
               mountPath: /csi
@@ -136,6 +136,8 @@ spec:
               name: sys-devices-dir
             - mountPath: /sys/class/
               name: sys-class
+            - mountPath: /images
+              name: image-dir
             - mountPath: /run/kata-containers/shared/direct-volumes
               name: kata-direct-volumes
           resources:
@@ -146,7 +148,7 @@ spec:
               memory: 20Mi
       volumes:
         - hostPath:
-            path: /var/lib/kubelet/plugins/cc.disk.csi.azure.com
+            path: /var/lib/kubelet/plugins/cc.local.csi.azure.com
             type: DirectoryOrCreate
           name: socket-dir
         - hostPath:
@@ -173,6 +175,10 @@ spec:
             path: /sys/class/
             type: Directory
           name: sys-class
+        - hostPath:
+            path: /var/lib/kubelet/plugins/cc.local.csi.azure.com/images
+            type: DirectoryOrCreate
+          name: image-dir
         - hostPath:
             path: /run/kata-containers/shared/direct-volumes/
             type: DirectoryOrCreate

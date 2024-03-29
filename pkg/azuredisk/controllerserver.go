@@ -19,7 +19,9 @@ package azuredisk
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,7 +33,6 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -41,13 +42,13 @@ import (
 
 	consts "sigs.k8s.io/azuredisk-csi-driver/pkg/azureconstants"
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
-	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization"
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
 	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
-	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 )
 
 const (
+	diskImageDirEnv = "DISK_IMAGE_DIR"
+
 	waitForSnapshotReadyInterval = 5 * time.Second
 	waitForSnapshotReadyTimeout  = 10 * time.Minute
 	maxErrMsgLength              = 990
@@ -68,11 +69,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		klog.Errorf("invalid create volume req: %v", req)
 		return nil, err
 	}
-	params := req.GetParameters()
-	diskParams, err := azureutils.ParseDiskParameters(params)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "Failed parsing disk parameters: %v", err)
-	}
 	name := req.GetName()
 	if len(name) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "CreateVolume Name must be provided")
@@ -82,297 +78,52 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, status.Error(codes.InvalidArgument, "CreateVolume Volume capabilities must be provided")
 	}
 
-	if err := azureutils.IsValidVolumeCapabilities(volCaps, diskParams.MaxShares); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	isAdvancedPerfProfile := strings.EqualFold(diskParams.PerfProfile, consts.PerfProfileAdvanced)
-	// If perfProfile is set to advanced and no/invalid device settings are provided, fail the request
-	if d.getPerfOptimizationEnabled() && isAdvancedPerfProfile {
-		if err := optimization.AreDeviceSettingsValid(consts.DummyBlockDevicePathLinux, diskParams.DeviceSettings); err != nil {
-			return nil, status.Error(codes.InvalidArgument, err.Error())
-		}
-	}
-
 	if acquired := d.volumeLocks.TryAcquire(name); !acquired {
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, name)
 	}
 	defer d.volumeLocks.Release(name)
 
+	diskImageDir, ok := os.LookupEnv(diskImageDirEnv)
+	if !ok {
+		return nil, status.Errorf(codes.Internal, "CreateVolume Environment variable is not set: %s", diskImageDirEnv)
+	}
+
+	image := filepath.Join(diskImageDir, name)
 	capacityBytes := req.GetCapacityRange().GetRequiredBytes()
-	volSizeBytes := int64(capacityBytes)
-	requestGiB := int(volumehelper.RoundUpGiB(volSizeBytes))
-
-	if diskParams.PerformancePlus != nil && *diskParams.PerformancePlus && requestGiB < consts.PerformancePlusMinimumDiskSizeGiB {
-		klog.Warningf("using PerformancePlus, increasing requested disk size from %vGiB to %vGiB (minimal size for PerformancePlus feature)", requestGiB, consts.PerformancePlusMinimumDiskSizeGiB)
-		requestGiB = consts.PerformancePlusMinimumDiskSizeGiB
-	}
-	if requestGiB < consts.MinimumDiskSizeGiB {
-		klog.Infof("increasing requested disk size from %vGiB to %vGiB (minimal disk size)", requestGiB, consts.MinimumDiskSizeGiB)
-		requestGiB = consts.MinimumDiskSizeGiB
+	volumeContext := map[string]string{
+		consts.CapacityBytesField: strconv.FormatInt(capacityBytes, 10),
 	}
 
-	maxVolSize := int(volumehelper.RoundUpGiB(req.GetCapacityRange().GetLimitBytes()))
-	if (maxVolSize > 0) && (maxVolSize < requestGiB) {
-		return nil, status.Error(codes.InvalidArgument, "After round-up, volume size exceeds the limit specified")
-	}
+	// TODO: Ensure idempotency, taking into account:
+	// accessibility_requirements, capacity_range, volume_capabilities,
+	// parameters, mutable_parameters.
 
-	if diskParams.Location == "" {
-		diskParams.Location = d.cloud.Location
-	}
-
-	localCloud := d.cloud
-	localDiskController := d.diskController
-
-	if diskParams.UserAgent != "" {
-		localCloud, err = azureutils.GetCloudProviderFromClient(ctx, d.kubeClient, d.cloudConfigSecretName, d.cloudConfigSecretNamespace, diskParams.UserAgent,
-			d.allowEmptyCloudConfig, d.enableTrafficManager, d.trafficManagerPort)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "create cloud with UserAgent(%s) failed with: (%s)", diskParams.UserAgent, err)
-		}
-		localDiskController = &ManagedDiskController{
-			controllerCommon: &controllerCommon{
-				cloud:               localCloud,
-				lockMap:             newLockMap(),
-				DisableDiskLunCheck: true,
-				clientFactory:       localCloud.ComputeClientFactory,
-				ForceDetachBackoff:  d.forceDetachBackoff,
-			},
-		}
-		localDiskController.DisableUpdateCache = d.disableUpdateCache
-		localDiskController.AttachDetachInitialDelayInMs = int(d.attachDetachInitialDelayInMs)
-
-	}
-	if azureutils.IsAzureStackCloud(localCloud.Config.Cloud, localCloud.Config.DisableAzureStackCloud) {
-		if diskParams.MaxShares > 1 {
-			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Invalid maxShares value: %d as Azure Stack does not support shared disk.", diskParams.MaxShares))
-		}
-	}
-
-	if diskParams.DiskName == "" {
-		diskParams.DiskName = name
-	}
-	diskParams.DiskName = azureutils.CreateValidDiskName(diskParams.DiskName)
-
-	if diskParams.ResourceGroup == "" {
-		diskParams.ResourceGroup = d.cloud.ResourceGroup
-	}
-
-	// normalize values
-	skuName, err := azureutils.NormalizeStorageAccountType(diskParams.AccountType, localCloud.Config.Cloud, localCloud.Config.DisableAzureStackCloud)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	if _, err := azureutils.NormalizeCachingMode(diskParams.CachingMode); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	if skuName == armcompute.DiskStorageAccountTypesPremiumV2LRS {
-		// PremiumV2LRS only supports None caching mode
-		azureutils.SetKeyValueInMap(diskParams.VolumeContext, consts.CachingModeField, string(v1.AzureDataDiskCachingNone))
-	}
-
-	if err := azureutils.ValidateDiskEncryptionType(diskParams.DiskEncryptionType); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	networkAccessPolicy, err := azureutils.NormalizeNetworkAccessPolicy(diskParams.NetworkAccessPolicy)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	publicNetworkAccess, err := azureutils.NormalizePublicNetworkAccess(diskParams.PublicNetworkAccess)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-
-	diskZone := azureutils.PickAvailabilityZone(req.GetAccessibilityRequirements(), diskParams.Location, topologyKey)
-	accessibleTopology := []*csi.Topology{}
-
-	if d.enableDiskCapacityCheck {
-		if ok, err := d.checkDiskCapacity(ctx, diskParams.SubscriptionID, diskParams.ResourceGroup, diskParams.DiskName, requestGiB); !ok {
-			return nil, err
-		}
-	}
-
-	contentSource := &csi.VolumeContentSource{}
-
-	if strings.EqualFold(diskParams.WriteAcceleratorEnabled, consts.TrueValue) {
-		diskParams.Tags[azure.WriteAcceleratorEnabled] = consts.TrueValue
-	}
-	var sourceID, sourceType string
-	metricsRequest := "controller_create_volume"
-	content := req.GetVolumeContentSource()
-	if content != nil {
-		if content.GetSnapshot() != nil {
-			sourceID = content.GetSnapshot().GetSnapshotId()
-			sourceType = consts.SourceSnapshot
-			contentSource = &csi.VolumeContentSource{
-				Type: &csi.VolumeContentSource_Snapshot{
-					Snapshot: &csi.VolumeContentSource_SnapshotSource{
-						SnapshotId: sourceID,
-					},
-				},
-			}
-			metricsRequest = "controller_create_volume_from_snapshot"
-		} else {
-			sourceID = content.GetVolume().GetVolumeId()
-			sourceType = consts.SourceVolume
-			contentSource = &csi.VolumeContentSource{
-				Type: &csi.VolumeContentSource_Volume{
-					Volume: &csi.VolumeContentSource_VolumeSource{
-						VolumeId: sourceID,
-					},
-				},
-			}
-			subsID := azureutils.GetSubscriptionIDFromURI(sourceID)
-			sourceGiB, disk, err := d.GetSourceDiskSize(ctx, subsID, diskParams.ResourceGroup, path.Base(sourceID), 0, consts.SourceDiskSearchMaxDepth)
-			if err == nil {
-				if sourceGiB != nil && *sourceGiB < int32(requestGiB) {
-					diskParams.VolumeContext[consts.ResizeRequired] = strconv.FormatBool(true)
-					klog.V(2).Infof("source disk(%s) size(%d) is less than requested size(%d), set resizeRequired as true", sourceID, *sourceGiB, requestGiB)
-				}
-				if disk != nil && len(disk.Zones) == 1 {
-					if disk.Zones[0] != nil {
-						diskZone = fmt.Sprintf("%s-%s", diskParams.Location, *disk.Zones[0])
-						klog.V(2).Infof("source disk(%s) is in zone(%s), set diskZone as %s", sourceID, *disk.Zones[0], diskZone)
-					}
-				}
-			} else {
-				klog.Warningf("failed to get source disk(%s) size, err: %v", sourceID, err)
-			}
-			metricsRequest = "controller_create_volume_from_volume"
-		}
-	}
-
-	if strings.HasSuffix(strings.ToLower(string(skuName)), "zrs") {
-		klog.V(2).Infof("diskZone(%s) is reset as empty since disk(%s) is ZRS(%s)", diskZone, diskParams.DiskName, skuName)
-		diskZone = ""
-		// make volume scheduled on all 3 availability zones
-		for i := 1; i <= 3; i++ {
-			topology := &csi.Topology{
-				Segments: map[string]string{topologyKey: fmt.Sprintf("%s-%d", diskParams.Location, i)},
-			}
-			accessibleTopology = append(accessibleTopology, topology)
-		}
-		// make volume scheduled on all non-zone nodes
-		topology := &csi.Topology{
-			Segments: map[string]string{topologyKey: ""},
-		}
-		accessibleTopology = append(accessibleTopology, topology)
-	} else {
-		accessibleTopology = []*csi.Topology{
-			{
-				Segments: map[string]string{topologyKey: diskZone},
-			},
-		}
-	}
-
-	klog.V(2).Infof("begin to create azure disk(%s) account type(%s) rg(%s) location(%s) size(%d) diskZone(%v) maxShares(%d)",
-		diskParams.DiskName, skuName, diskParams.ResourceGroup, diskParams.Location, requestGiB, diskZone, diskParams.MaxShares)
-
-	if skuName == armcompute.DiskStorageAccountTypesUltraSSDLRS {
-		if diskParams.DiskIOPSReadWrite == "" && diskParams.DiskMBPSReadWrite == "" {
-			// set default DiskIOPSReadWrite, DiskMBPSReadWrite per request size
-			diskParams.DiskIOPSReadWrite = strconv.Itoa(getDefaultDiskIOPSReadWrite(requestGiB))
-			diskParams.DiskMBPSReadWrite = strconv.Itoa(getDefaultDiskMBPSReadWrite(requestGiB))
-			klog.V(2).Infof("set default DiskIOPSReadWrite as %s, DiskMBPSReadWrite as %s on disk(%s)", diskParams.DiskIOPSReadWrite, diskParams.DiskMBPSReadWrite, diskParams.DiskName)
-		}
-	}
-
-	diskParams.VolumeContext[consts.RequestedSizeGib] = strconv.Itoa(requestGiB)
-	volumeOptions := &ManagedDiskOptions{
-		AvailabilityZone:    diskZone,
-		BurstingEnabled:     diskParams.EnableBursting,
-		DiskEncryptionSetID: diskParams.DiskEncryptionSetID,
-		DiskEncryptionType:  diskParams.DiskEncryptionType,
-		DiskIOPSReadWrite:   diskParams.DiskIOPSReadWrite,
-		DiskMBpsReadWrite:   diskParams.DiskMBPSReadWrite,
-		DiskName:            diskParams.DiskName,
-		LogicalSectorSize:   int32(diskParams.LogicalSectorSize),
-		MaxShares:           int32(diskParams.MaxShares),
-		ResourceGroup:       diskParams.ResourceGroup,
-		SubscriptionID:      diskParams.SubscriptionID,
-		SizeGB:              requestGiB,
-		StorageAccountType:  skuName,
-		SourceResourceID:    sourceID,
-		SourceType:          sourceType,
-		Tags:                diskParams.Tags,
-		Location:            diskParams.Location,
-		PerformancePlus:     diskParams.PerformancePlus,
-	}
-
-	volumeOptions.SkipGetDiskOperation = d.isGetDiskThrottled()
-	// Azure Stack Cloud does not support NetworkAccessPolicy, PublicNetworkAccess
-	if !azureutils.IsAzureStackCloud(localCloud.Config.Cloud, localCloud.Config.DisableAzureStackCloud) {
-		volumeOptions.NetworkAccessPolicy = networkAccessPolicy
-		volumeOptions.PublicNetworkAccess = publicNetworkAccess
-		if diskParams.DiskAccessID != "" {
-			volumeOptions.DiskAccessID = &diskParams.DiskAccessID
-		}
-	}
-
-	var diskURI string
-	mc := metrics.NewMetricContext(consts.AzureDiskCSIDriverName, metricsRequest, d.cloud.ResourceGroup, d.cloud.SubscriptionID, d.Name)
-	isOperationSucceeded := false
-	defer func() {
-		mc.ObserveOperationWithResult(isOperationSucceeded, consts.VolumeID, diskURI)
-	}()
-
-	diskURI, err = localDiskController.CreateManagedDisk(ctx, volumeOptions)
-	if err != nil {
-		if strings.Contains(err.Error(), consts.NotFound) {
-			return nil, status.Error(codes.NotFound, err.Error())
-		}
-		return nil, status.Errorf(codes.Internal, err.Error())
-	}
-
-	isOperationSucceeded = true
-	klog.V(2).Infof("create azure disk(%s) account type(%s) rg(%s) location(%s) size(%d) tags(%s) successfully", diskParams.DiskName, skuName, diskParams.ResourceGroup, diskParams.Location, requestGiB, diskParams.Tags)
+	// TODO: Handle accessibility_requirements.
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			VolumeId:           diskURI,
-			CapacityBytes:      volumehelper.GiBToBytes(int64(requestGiB)),
-			VolumeContext:      diskParams.VolumeContext,
-			ContentSource:      contentSource,
-			AccessibleTopology: accessibleTopology,
+			VolumeId:           image,
+			CapacityBytes:      capacityBytes,
+			VolumeContext:      volumeContext,
+			ContentSource:      nil, // TODO: Handle this field.
+			AccessibleTopology: nil, // TODO: Handle this field.
 		},
 	}, nil
 }
 
 // DeleteVolume delete an azure disk
 func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
-	if len(volumeID) == 0 {
+	image := req.GetVolumeId()
+	if len(image) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
 	}
 
 	if err := d.ValidateControllerServiceRequest(csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME); err != nil {
 		return nil, status.Errorf(codes.Internal, "invalid delete volume req: %v", req)
 	}
-	diskURI := volumeID
 
-	if err := azureutils.IsValidDiskURI(diskURI); err != nil {
-		klog.Errorf("validateDiskURI(%s) in DeleteVolume failed with error: %v", diskURI, err)
-		return &csi.DeleteVolumeResponse{}, nil
-	}
-
-	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
-		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
-	}
-	defer d.volumeLocks.Release(volumeID)
-
-	mc := metrics.NewMetricContext(consts.AzureDiskCSIDriverName, "controller_delete_volume", d.cloud.ResourceGroup, d.cloud.SubscriptionID, d.Name)
-	isOperationSucceeded := false
-	defer func() {
-		mc.ObserveOperationWithResult(isOperationSucceeded, consts.VolumeID, diskURI)
-	}()
-
-	klog.V(2).Infof("deleting azure disk(%s)", diskURI)
-	err := d.diskController.DeleteManagedDisk(ctx, diskURI)
-	klog.V(2).Infof("delete azure disk(%s) returned with %v", diskURI, err)
-	isOperationSucceeded = (err == nil)
-	return &csi.DeleteVolumeResponse{}, err
+	// No-op as CreateVolume has no side effects.
+	return &csi.DeleteVolumeResponse{}, nil
 }
 
 // ControllerGetVolume get volume
